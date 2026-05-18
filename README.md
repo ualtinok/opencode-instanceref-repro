@@ -1,61 +1,107 @@
 # OpenCode `InstanceRef not provided` reproducer
 
-A ~100-line reproducer showing that **`InstanceState.get`'s cached lookup
-in OpenCode v1.15.4 still dies with `InstanceRef not provided`**, despite
-PR #28051 having landed.
-
-> Originally surfaced while debugging
-> [`@cortexkit/aft-opencode`](https://github.com/cortexkit/aft) bash failures
-> on OpenCode v1.15.x.
+A self-contained Docker repro for the runtime error every OpenCode plugin
+hits when it calls `ctx.ask(...)` on OpenCode **1.15.4+**. PR
+[#28051](https://github.com/anomalyco/opencode/pull/28051) cleaned up
+`Bus.publish` in fibers but did NOT touch the cached lookup in
+`InstanceState.get`, which is where this error originates.
 
 ## TL;DR
 
-- PR [#28051](https://github.com/anomalyco/opencode/pull/28051) fixed
-  `Bus.publish` from detached fibers (Class 2 in the original handoff).
-  Shipped in **v1.15.4**.
-- The original cached-lookup issue (Class 1, identified in PR
-  [#25694](https://github.com/anomalyco/opencode/pull/25694)) is **still
-  unfixed** at `packages/opencode/src/effect/instance-state.ts:50-53`:
+| Component | Version |
+| --- | --- |
+| OpenCode | 1.15.4 (default ARG; bug also reproduces on `dev`) |
+| Affected line | `packages/opencode/src/effect/instance-state.ts:50-53` |
+| Plugin | a hand-written 50-line plugin in `plugin/index.js` — no real-world plugins involved |
+| LLM | aimock, scripted to call the plugin tool once |
 
-  ```ts
-  export const get = <A, E, R>(self: InstanceState<A, E, R>) =>
-    Effect.gen(function* () {
-      return yield* ScopedCache.get(self.cache, yield* directory)
-    })
-  ```
+Every plugin that gates work behind `ctx.ask(...)` — read, write, edit, bash,
+grep, glob, custom permission tools — fails identically. The error text is
+literally `"InstanceRef not provided"`.
 
-- `ScopedCache.make({ lookup })` (in `make()` at lines 32-37) runs `lookup`
-  on a fiber that does **NOT** inherit `InstanceRef`, so the FIRST cache
-  miss for any `InstanceState.get(SomeStorage)` dies with
-  `InstanceRef not provided`.
-- `has()` (lines 62-65) and `invalidate()` (67-70) have the same broken
-  pattern but are cold paths today.
+## Run it
 
-## Why this matters
+```bash
+docker build -t opencode-instanceref-repro .
+docker run --rm opencode-instanceref-repro
+```
 
-Any plugin that calls the OpenCode SDK from inside a tool handler — or any
-internal server endpoint that walks into `InstanceState.get` — can throw
-`InstanceRef not provided` on first call per directory.
+Expected tail of output:
 
-For AFT specifically, this breaks bash:
+```
+=== Summary ===
+InstanceRef matches in stdout: 0
+InstanceRef matches in stderr: 3
+REPRODUCED: "InstanceRef not provided" surfaced during a normal plugin permission ask.
+```
 
-- AFT's hoisted `bash` calls `client.session.get(sessionID)` on first session
-  call (subagent detection).
-- AFT's background-bash completion calls `client.session.promptAsync(...)`
-  to wake the agent.
-- Both server endpoints walk into `InstanceState.get(SomeStorage)`, hit the
-  cache miss, run `lookup` on a detached fiber, and die.
+Exit code `0` = reproduced.
 
-End-user symptom: bash tool calls hang and time out at the plugin transport
-timeout (30s) on v1.15.x.
+## What it actually does
 
-## Recommended fix
+1. Installs `opencode-ai@1.15.4`, `@copilotkit/aimock@1.24.0`, Node 24.
+2. Drops a 50-line plugin at `/repro/plugin/index.js` that registers a
+   single tool named `bash` (overriding OpenCode's built-in by name).
+   The tool's `execute` callback does:
 
-Revive PR #25694 (or land an equivalent change). Wrap the cache call with
-`Effect.provideService(InstanceRef, ctx)`:
+   ```js
+   await Effect.runPromise(
+     context.ask({ permission: "edit", patterns: ["**/*"], always: ["*"], metadata: {} })
+   );
+   ```
+
+   The plugin imports `tool` from `@opencode-ai/plugin` (NOT from the
+   `PluginInput` destructure — that input has no `tool` property in
+   1.15.4, so destructuring it silently kills plugin registration).
+
+3. Registers aimock as an OpenAI-compatible provider in
+   `~/.config/opencode/opencode.json`.
+4. The driver script starts aimock, runs `opencode run "..."`, aimock
+   answers the first turn with a tool call to `bash`, opencode dispatches
+   to the plugin's `bash` (since later registrations overwrite earlier
+   ones in `session/prompt.ts` `tools[item.id] = ...`), and the
+   `await Effect.runPromise(...)` throws.
+5. The driver greps the run output for `"InstanceRef not provided"` and
+   exits 0 on match.
+
+### Caveat about plugin shape
+
+Plugin tool registration is finicky. The plugin's default export must:
+- Be `async function(input) { ... }` — destructuring `{ tool }` from
+  input does NOT work; the input object has no `tool`. Import `tool`
+  from `@opencode-ai/plugin` separately.
+- Use `tool({...})` from `@opencode-ai/plugin` for every entry. Plain
+  objects work in some code paths but the official path is via the
+  helper, which keeps Zod schemas correctly typed.
+- Match the built-in tool's `args` shape closely when overriding (otherwise
+  the LLM's call fails schema validation BEFORE hitting your execute).
+
+## Bug mechanism
+
+The Effect returned from `context.ask(...)` resolves permission policy by
+walking through OpenCode's `InstanceState` consumers. On a cache miss,
+`InstanceState.get` schedules its `ScopedCache.lookup` on a fiber that does
+**not** inherit the host's `InstanceRef` service:
 
 ```ts
-// packages/opencode/src/effect/instance-state.ts:50-53
+// packages/opencode/src/effect/instance-state.ts:50-53 — current
+export const get = <A, E, R>(self: InstanceState<A, E, R>) =>
+  Effect.gen(function* () {
+    return yield* ScopedCache.get(self.cache, yield* directory)
+  })
+```
+
+`ScopedCache.make({ lookup })` (line 32-37) declares `lookup` as
+`() => Effect.gen(function* () { yield* context })`. When `ScopedCache.get`
+hits a miss it runs that lookup; the lookup's `yield* context` then fails
+because no `InstanceRef` is provided in the cache-miss fiber's environment.
+
+## Fix
+
+Wrap the `ScopedCache` operation so it executes with `InstanceRef`
+re-provided:
+
+```ts
 export const get = <A, E, R>(self: InstanceState<A, E, R>) =>
   Effect.gen(function* () {
     const ctx = yield* context
@@ -65,124 +111,21 @@ export const get = <A, E, R>(self: InstanceState<A, E, R>) =>
   })
 ```
 
-Apply the same wrap to `has()` (62-65) and `invalidate()` (67-70).
+`has()` (line 62-65) and `invalidate()` (line 67-70) have the same broken
+pattern and should receive the same wrap preventatively, but they are cold
+paths — only `get()` causes user-visible plugin failures today.
 
-## How to reproduce
+## Why this is OpenCode-side
 
-### Docker one-command repro
+The error text is produced by OpenCode's own service-resolution layer, not
+by any plugin code. Every plugin observed today does the standard pattern:
 
-```bash
-docker build -t opencode-instanceref-repro .
-docker run --rm opencode-instanceref-repro
+```js
+await Effect.runPromise(context.ask({...}));
 ```
 
-The container installs `opencode-ai@1.15.4`, registers this plugin, starts
-OpenCode briefly, runs five SDK probes from the plugin (`app.log`,
-`session.list`, `find.files`, `file.status`, `config.providers`), captures
-errors, and exits successfully when at least one probe surfaces
-`InstanceRef not provided` — either in the SDK error message it gets back,
-or in OpenCode's own stderr.
-
-Override the version to test a fixed build:
-
-```bash
-docker build --build-arg OPENCODE_VERSION=1.15.10 -t opencode-instanceref-repro .
-docker run --rm opencode-instanceref-repro
-```
-
-### Manual repro
-
-1. Add this plugin to your OpenCode config:
-
-   ```jsonc
-   // ~/.config/opencode/opencode.jsonc
-   {
-     "plugin": [
-       "file:///absolute/path/to/opencode-instanceref-repro"
-     ]
-   }
-   ```
-
-2. Clear the log:
-
-   ```bash
-   rm -f "${TMPDIR:-/tmp}/instanceref-repro.log"
-   # or: npm run clean-log
-   ```
-
-3. Start OpenCode in any project. The plugin runs five SDK probes
-   asynchronously during init. Wait ~5s.
-
-4. Read the log:
-
-   ```bash
-   cat "${TMPDIR:-/tmp}/instanceref-repro.log"
-   # or: npm run show-log
-   ```
-
-5. Optionally, ask the model to call the `__instanceref_repro_check` tool —
-   that re-runs the probe sequence with `PROBE tool` log lines, useful for
-   reproducing the failure from a real tool-execution path (which is what
-   AFT bash hits).
-
-## Expected vs actual output
-
-### ✅ Expected (fixed)
-
-Every probe succeeds:
-
-```
-[t0] MODULE LOAD pid=... import_meta_url=file:///repro/src/index.js
-[t1] plugin() invocation pid=... invocation=#1 directory=/work/project client_typeof=object
-[t2] PROBE init app.log: OK preview={...}
-[t3] PROBE init session.list: OK preview=[...]
-[t4] PROBE init find.files: OK preview=[...]
-[t5] PROBE init file.status: OK preview=[...]
-[t6] PROBE init config.providers: OK preview=[...]
-```
-
-### ❌ Actual (observed on v1.15.4)
-
-At least one probe fails with `instance_ref_match=true` and at least one
-`REPRODUCED:` line, e.g.:
-
-```
-[t0] MODULE LOAD ...
-[t1] plugin() invocation invocation=#1 directory=/work/project client_typeof=object
-[t2] PROBE init app.log: OK ...
-[t3] PROBE init session.list: ERROR instance_ref_match=true message=InstanceRef not provided
-[t4] REPRODUCED: session.list returned "InstanceRef not provided"
-...
-```
-
-Or — if the server-side dies but the SDK call returns a generic error —
-`InstanceRef not provided` appears in OpenCode's stderr (captured in the
-script summary at the end).
-
-## Cleanup
-
-Remove the plugin entry from your OpenCode config:
-
-```jsonc
-{
-  "plugin": [
-    // remove this line:
-    // "file:///absolute/path/to/opencode-instanceref-repro"
-  ]
-}
-```
-
-Optionally remove the log:
-
-```bash
-rm -f "${TMPDIR:-/tmp}/instanceref-repro.log"
-```
-
-## Files
-
-- `src/index.js` — plugin with five SDK probes (~120 lines)
-- `Dockerfile` — pins `opencode-ai@1.15.4`, installs the plugin
-- `reproduce-instanceref.sh` — entrypoint that runs OpenCode + the probes
-  and exits 0 only when reproduced
-- `package.json` — declares `oc-plugin: ["server"]`
-- `README.md` — this document
+That pattern is what OpenCode's own internal permission handlers use too.
+There is no plugin-side workaround that doesn't either silently bypass the
+user's permission rules (security regression) or stop using `ctx.ask`
+entirely (which means the plugin is no longer compatible with OpenCode's
+permission system).

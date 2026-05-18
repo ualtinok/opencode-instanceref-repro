@@ -1,0 +1,11 @@
+{
+  "name": "instanceref-repro-plugin",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "main": "index.js",
+  "dependencies": {
+    "@opencode-ai/plugin": "1.15.4",
+    "effect": "4.0.0-beta.65"
+  }
+}
