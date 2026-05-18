@@ -1,0 +1,16 @@
+{
+  "name": "opencode-instanceref-repro",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "description": "Minimal reproducer for OpenCode 'InstanceRef not provided' from InstanceState.get cached lookup (instance-state.ts:50-53)",
+  "license": "MIT",
+  "oc-plugin": [
+    "server"
+  ],
+  "scripts": {
+    "clean-log": "rm -f \"${TMPDIR:-/tmp}/instanceref-repro.log\"",
+    "show-log": "cat \"${TMPDIR:-/tmp}/instanceref-repro.log\""
+  }
+}
